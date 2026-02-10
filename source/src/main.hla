@@ -1,1 +1,72 @@
+---auto---
+# <rust:colored:Colorize>
+# <rust:std:io:Write>
+
+! Definicja paska postępu
+obj ProgressBar [
+    def width: i32;
+    def style: String;
+    mut current: f64;
+    mut total: f64;
+
+    sub new(w: i32, s: String, t: f64) -> ProgressBar [
+        return ProgressBar {
+            width: w,
+            style: s,
+            current: 0,
+            total: t
+        };
+    ]
+
+    sub update(mut self, amount: f64) [
+        self.current = self.current + amount;
+        self.render();
+    ]
+
+    sub render(self) [
+        def progress: f64 = self.current / self.total;
+        def filled_len: i32 = (self.width * progress);
+        
+        mut bar: String = "";
+        
+        ! Wybór stylu wizualnego
+        if self.style == "block" [
+            bar = "█" * filled_len;
+        ] elif self.style == "neon" [
+            bar = "⚡" * filled_len;
+        ] elif self.style == "gradient" [
+            bar = "▓" * filled_len;
+        ] else [
+            bar = "#" * filled_len;
+        ]
+
+        def padding: String = " " * (self.width - filled_len);
+        def percent: f64 = progress * 100;
+
+        ! Logowanie do terminala (w HLA mapowane na println!)
+        log "[" + bar + padding + "] " + percent + "%";
+    ]
+]
+
+sub main() [
+    log "--- Inicjalizacja Mega Progress Bar ---";
+
+    ! Tworzymy klasyczny pasek blokowy
+    mut p1: ProgressBar = ProgressBar.new(20, "block", 100.0);
+    
+    log "Ładowanie systemu...";
+    p1.update(25.0);
+    p1.update(25.0);
+    p1.update(50.0);
+
+    ! Tworzymy stylowy pasek neonowy
+    mut p2: ProgressBar = ProgressBar.new(15, "neon", 10.0);
+    log "Zhakowanie bazy danych...";
+    
+    loop i in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9) [
+        p2.update(1.0);
+    ]
+
+    log "Operacja zakończona sukcesem.";
+]
 
