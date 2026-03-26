@@ -1,1 +1,411 @@
+// progress-bar.hcs – zaawansowane paski postępu dla HackerScript
+// Użycie: from [progress-bar] require [ProgressBar, MultiProgress, ProgressStyle, set_style, inc, set_position, set_message, finish, finish_with_message]
 
+from [std] require [io, string, math]
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Typy i struktury
+// ──────────────────────────────────────────────────────────────────────────────
+
+enum ProgressStyleType
+    Default
+    Spinner
+    Bytes
+    Template
+end
+
+/// Styl paska postępu
+obj ProgressStyle
+    style_type: ProgressStyleType
+    bar_char: str           // np. "█"
+    bar_char_finished: str  // np. "█" lub "▓"
+    bar_char_remaining: str // np. "░"
+    color: str              // kod ANSI
+    template: str           // niestandardowy szablon (np. "{spinner} {bar} {percent}%")
+    spinner_frames: [str]   // ramki dla spinnery (np. ["⠋", "⠙", "⠹", ...])
+    spinner_idx: i64
+end
+
+/// Pojedynczy pasek postępu
+obj ProgressBar
+    total: u64
+    current: u64
+    message: str            // tekst przed paskiem
+    style: ProgressStyle
+    start_time: i64         // w mikrosekundach
+    last_draw_time: i64
+    finished: bool
+    width: i32              // szerokość paska (z terminala)
+    line_idx: i32           // indeks linii w MultiProgress (dla wielokrotnych)
+end
+
+/// Zarządca wielu pasków
+obj MultiProgress
+    bars: [ProgressBar]
+    max_bars: i32
+    active: bool
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Deklaracje extern (C)
+// ──────────────────────────────────────────────────────────────────────────────
+
+extern
+    header [stdio.h]
+    header [unistd.h]
+    header [sys/time.h]
+    header [sys/ioctl.h]
+    header [time.h]
+    header [pthread.h]        // opcjonalnie dla wątków
+
+    fn gettimeofday(ptr tv, ptr tz) : i32
+    fn usleep(u32 usec) : i32
+    fn ioctl(i32 fd, u64 request, ptr ws) : i32
+    struct timeval { tv_sec: i64, tv_usec: i64 }
+    struct winsize { ws_row: u16, ws_col: u16, ws_xpixel: u16, ws_ypixel: u16 }
+    const TIOCGWINSZ: u64 = 0x5413
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Funkcje pomocnicze
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn get_terminal_width() : i32
+    direct
+        let ws: winsize
+        if ioctl(1, TIOCGWINSZ, &ws) == 0
+            return ws.ws_col as i32
+        end
+        return 80
+    end
+end
+
+fn current_time_us() : i64
+    direct
+        let tv: timeval
+        gettimeofday(&tv, 0)
+        return tv.tv_sec as i64 * 1000000 + tv.tv_usec as i64
+    end
+end
+
+fn format_duration(secs: f64) : str
+    if secs < 60.0
+        return format("{:.1}s", secs)
+    else if secs < 3600.0
+        let m = secs / 60.0
+        return format("{:.0}m {:.0}s", m, secs % 60.0)
+    else
+        let h = secs / 3600.0
+        let m = (secs % 3600.0) / 60.0
+        return format("{:.0}h {:.0}m", h, m)
+    end
+end
+
+fn format_bytes(bytes: u64) : str
+    if bytes < 1024
+        return format("{} B", bytes)
+    else if bytes < 1024*1024
+        return format("{:.1} KiB", bytes as f64 / 1024.0)
+    else if bytes < 1024*1024*1024
+        return format("{:.1} MiB", bytes as f64 / (1024.0*1024.0))
+    else
+        return format("{:.1} GiB", bytes as f64 / (1024.0*1024.0*1024.0))
+    end
+end
+
+fn format_rate(bytes: u64, elapsed_secs: f64) : str
+    if elapsed_secs <= 0.0
+        return "0 B/s"
+    end
+    let rate = bytes as f64 / elapsed_secs
+    if rate < 1024.0
+        return format("{:.1} B/s", rate)
+    else if rate < 1024.0*1024.0
+        return format("{:.1} KiB/s", rate / 1024.0)
+    else
+        return format("{:.1} MiB/s", rate / (1024.0*1024.0))
+    end
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Implementacja stylu
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn progress_style_default() : ProgressStyle
+    let s = HCS_ALLOC_ZERO(_scope_arena, ProgressStyle)
+    s.style_type = ProgressStyleType.Default
+    s.bar_char = "█"
+    s.bar_char_finished = "█"
+    s.bar_char_remaining = "░"
+    s.color = "\x1b[32m"  // zielony
+    s.template = "{spinner} {bar} {percent:>3}% ETA {eta} [{elapsed}<{remaining}] {msg}"
+    s.spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    s.spinner_idx = 0
+    return s
+end
+
+fn progress_style_bytes() : ProgressStyle
+    let s = progress_style_default()
+    s.style_type = ProgressStyleType.Bytes
+    s.template = "{spinner} {bar} {bytes} / {total_bytes} ({percent:>3}%) {msg} {rate}"
+    return s
+end
+
+fn progress_style_spinner() : ProgressStyle
+    let s = progress_style_default()
+    s.style_type = ProgressStyleType.Spinner
+    s.template = "{spinner} {msg} ({elapsed})"
+    return s
+end
+
+fn progress_style_template(tmpl: str) : ProgressStyle
+    let s = progress_style_default()
+    s.style_type = ProgressStyleType.Template
+    s.template = tmpl
+    return s
+end
+
+fn set_style(pb: ProgressBar, style: ProgressStyle)
+    pb.style = style
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tworzenie paska
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn progress_bar_new(total: u64, message: str) : ProgressBar
+    let pb = HCS_ALLOC_ZERO(_scope_arena, ProgressBar)
+    pb.total = total
+    pb.current = 0
+    pb.message = message
+    pb.style = progress_style_default()
+    pb.start_time = current_time_us()
+    pb.last_draw_time = pb.start_time
+    pb.finished = false
+    pb.width = get_terminal_width() - 20  // zostaw miejsce na tekst
+    if pb.width < 20 then pb.width = 20 end
+    pb.line_idx = -1  // nie w multi
+    return pb
+end
+
+fn inc(pb: ProgressBar, delta: u64)
+    pb.current += delta
+    if pb.current > pb.total then pb.current = pb.total end
+    draw(pb)
+end
+
+fn set_position(pb: ProgressBar, pos: u64)
+    pb.current = pos
+    if pb.current > pb.total then pb.current = pb.total end
+    draw(pb)
+end
+
+fn set_message(pb: ProgressBar, msg: str)
+    pb.message = msg
+    draw(pb)
+end
+
+fn finish(pb: ProgressBar)
+    pb.finished = true
+    draw(pb)
+    // nowa linia po pasku
+    direct { printf("\n"); }
+end
+
+fn finish_with_message(pb: ProgressBar, msg: str)
+    pb.message = msg
+    finish(pb)
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Rysowanie pojedynczego paska (z użyciem ANSI)
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn draw(pb: ProgressBar)
+    if pb.finished and pb.current == pb.total and pb.last_draw_time == pb.start_time
+        // już rysowano po zakończeniu
+        return
+    end
+    let now = current_time_us()
+    let elapsed_secs = (now - pb.start_time) as f64 / 1_000_000.0
+    let eta_secs = if pb.current > 0
+        (pb.total - pb.current) as f64 * elapsed_secs / pb.current as f64
+    else
+        0.0
+    end
+    let percent = if pb.total > 0
+        (pb.current as f64 / pb.total as f64) * 100.0
+    else
+        0.0
+    end
+    let bar_len = pb.width as i32
+    let filled_len = (pb.current as f64 / pb.total as f64) * bar_len as f64
+    let filled = filled_len as i32
+    let remaining = bar_len - filled
+
+    // Budowanie szablonu
+    let mut output = "" as str
+    // kursor na początku linii, wyczyść
+    direct { printf("\r\x1b[2K"); }
+    // dodaj kolor
+    output += pb.style.color
+    // iteruj po szablonie i podmieniaj tokeny
+    let tmpl = pb.style.template
+    let mut i = 0
+    while i < tmpl.len
+        if tmpl.ptr[i] as i32 == 123 and i+1 < tmpl.len  // '{'
+            let start = i+1
+            let mut j = start
+            while j < tmpl.len and tmpl.ptr[j] as i32 != 125
+                j += 1
+            end
+            if j < tmpl.len
+                let token = tmpl.ptr[start..j] as str
+                if token == "spinner"
+                    let frame = pb.style.spinner_frames[pb.style.spinner_idx]
+                    pb.style.spinner_idx = (pb.style.spinner_idx + 1) % pb.style.spinner_frames.len
+                    output += frame
+                else if token == "bar"
+                    output += pb.style.bar_char * filled
+                    output += pb.style.bar_char_remaining * remaining
+                else if token == "percent"
+                    output += format("{:3.0}", percent)
+                else if token == "elapsed"
+                    output += format_duration(elapsed_secs)
+                else if token == "eta"
+                    if eta_secs > 0.0
+                        output += format_duration(eta_secs)
+                    else
+                        output += "?"
+                    end
+                else if token == "remaining"
+                    if eta_secs > 0.0
+                        output += format_duration(eta_secs)
+                    else
+                        output += "?"
+                    end
+                else if token == "msg"
+                    output += pb.message
+                else if token == "bytes"
+                    output += format_bytes(pb.current)
+                else if token == "total_bytes"
+                    output += format_bytes(pb.total)
+                else if token == "rate"
+                    output += format_rate(pb.current, elapsed_secs)
+                else
+                    output += token  // unknown token keep as is
+                end
+                i = j+1
+                continue
+            end
+        end
+        output += tmpl.ptr[i] as char
+        i += 1
+    end
+    output += "\x1b[0m"  // reset koloru
+    direct { printf("%s", output.ptr); fflush(stdout); }
+    pb.last_draw_time = now
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// MultiProgress – zarządzanie wieloma paskami
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn multi_progress_new() : MultiProgress
+    let mp = HCS_ALLOC_ZERO(_scope_arena, MultiProgress)
+    mp.bars = []
+    mp.max_bars = 0
+    mp.active = false
+    return mp
+end
+
+fn multi_progress_add(mp: MultiProgress, pb: ProgressBar)
+    pb.line_idx = mp.bars.len
+    mp.bars.push(pb)
+    mp.max_bars += 1
+    // Jeśli to pierwszy pasek, przygotuj ekran (zapisz pozycję kursora)
+    if mp.bars.len == 1
+        direct { printf("\n"); }  // jedna linia odstępu
+    end
+    // Przesuń kursor w dół o liczbę istniejących pasków
+    // Narysuj wszystkie paski od nowa
+    multi_progress_draw(mp)
+end
+
+fn multi_progress_draw(mp: MultiProgress)
+    if mp.bars.len == 0 then return end
+    // Przesuń kursor na górę obszaru pasków
+    // zapamiętaj aktualną pozycję kursora
+    direct { printf("\x1b[s"); }  // zapisz pozycję
+    // przejdź do początku pierwszego paska (cofając się o liczbę linii)
+    direct { printf("\x1b[%dA", mp.max_bars); }
+    for pb in mp.bars
+        draw(pb)  // draw wypisze w bieżącej linii
+        direct { printf("\n"); }  // przejdź do następnej linii
+    end
+    direct { printf("\x1b[u"); }  // przywróć pozycję
+    fflush(stdout)
+end
+
+// Funkcje do aktualizacji wielu pasków – wywołują multi_progress_draw
+fn multi_inc(mp: MultiProgress, idx: i32, delta: u64)
+    if idx >= 0 and idx < mp.bars.len
+        inc(mp.bars[idx], delta)
+    end
+    multi_progress_draw(mp)
+end
+
+fn multi_set_position(mp: MultiProgress, idx: i32, pos: u64)
+    if idx >= 0 and idx < mp.bars.len
+        set_position(mp.bars[idx], pos)
+    end
+    multi_progress_draw(mp)
+end
+
+fn multi_set_message(mp: MultiProgress, idx: i32, msg: str)
+    if idx >= 0 and idx < mp.bars.len
+        set_message(mp.bars[idx], msg)
+    end
+    multi_progress_draw(mp)
+end
+
+fn multi_finish(mp: MultiProgress, idx: i32)
+    if idx >= 0 and idx < mp.bars.len
+        finish(mp.bars[idx])
+        mp.bars[idx] = nil  // usunięcie z listy (opcjonalnie)
+        mp.max_bars -= 1
+    end
+    multi_progress_draw(mp)
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Przykład użycia (komentarz)
+// ──────────────────────────────────────────────────────────────────────────────
+/*
+from [progress-bar] require [ProgressBar, MultiProgress, inc, set_message, finish]
+
+fn main() : i32
+    let pb = progress_bar_new(100, "Processing")
+    for i in 0..100
+        inc(pb, 1)
+        usleep(50000)  // symulacja pracy
+        if i == 50 then set_message(pb, "Halfway!") end
+    end
+    finish(pb)
+
+    // Przykład z wieloma paskami
+    let mp = multi_progress_new()
+    let pb1 = progress_bar_new(200, "Task 1")
+    let pb2 = progress_bar_new(150, "Task 2")
+    multi_progress_add(mp, pb1)
+    multi_progress_add(mp, pb2)
+    for i in 0..200
+        if i < 150 then multi_inc(mp, 1, 1) end
+        multi_inc(mp, 0, 1)
+        usleep(30000)
+    end
+    multi_finish(mp, 0)
+    multi_finish(mp, 1)
+    return 0
+end
+*/
